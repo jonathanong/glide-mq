@@ -2,6 +2,7 @@
 
 ## Current State
 
+- **Coverage PR**: `test/integration-coverage-gaps` (fork #25 / upstream #280) — rebased onto v0.15.5. Live Valkey/proxy integration tests only. Source fixes: proxy `lockDuration` allowlist, `Job.getParents()` last-colon parse, proxy SSE loops exit on `draining`, `getSharedClient` gated on drain.
 - **In flight**: rate-limited token-bucket promotion skips bounded tombstones and advances both ordered frontiers without stranding successors.
 - **Audit fix**: `fix/repeat-after-stalled` atomically advances repeat-after-complete schedulers during terminal stalled recovery.
 - **Branch**: `automation/cover-open-fixes-20260825` consolidates the reviewed correctness queue.
