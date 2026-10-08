@@ -627,6 +627,7 @@ export class TestQueue<D = any, R = any> extends EventEmitter {
   private suspendedTimeoutTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private promotionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private waitRejectors: Set<(err: Error) => void> = new Set();
+  private waitSweepers: Set<() => void> = new Set();
 
   constructor(name: string, opts?: TestQueueOptions) {
     super();
@@ -688,6 +689,87 @@ export class TestQueue<D = any, R = any> extends EventEmitter {
       );
     }
     return this.waitForJobResult(job.id, waitTimeout);
+  }
+
+  /**
+   * Resolve once every given job has settled, without pausing, draining or closing
+   * anything. Accepts the result of addBulk() or several add() calls; null entries
+   * (deduplicated or duplicate-id adds) are ignored. A job whose record is gone
+   * (removeOnComplete / removeOnFail) counts as settled. Rejects with the first
+   * terminal failure (a failed attempt that will retry does not count), on timeout
+   * (naming the pending ids), or when the queue closes.
+   */
+  async waitForJobs(
+    jobs: ReadonlyArray<{ id: string } | null | undefined>,
+    opts?: { timeout?: number },
+  ): Promise<void> {
+    const timeout = opts?.timeout ?? 30000;
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > MAX_TIMEOUT_DELAY_MS) {
+      throw new Error(`timeout must be a positive finite number no greater than ${MAX_TIMEOUT_DELAY_MS}`);
+    }
+    const pending = new Set<string>();
+    for (const job of jobs) if (job) pending.add(job.id);
+    if (pending.size === 0) return;
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.waitRejectors.delete(rejectOnClose);
+        this.waitSweepers.delete(sweep);
+        this.off('completed', onCompleted);
+        this.off('failed', onFailed);
+        this.off('revoked', onRevoked);
+        this.off('removed', sweep);
+        this.off('drained', sweep);
+      };
+      const rejectOnClose = (err: Error) => {
+        cleanup();
+        reject(err);
+      };
+      const settle = (id: string) => {
+        if (!pending.delete(id) || pending.size > 0) return;
+        cleanup();
+        resolve();
+      };
+      const onCompleted = (job: TestJob<D, R>) => settle(job.id);
+      const onFailed = (job: TestJob<D, R>, err: Error) => {
+        if (!pending.has(job.id)) return;
+        cleanup();
+        reject(err);
+      };
+      // revoke() fails a not-yet-active job without a `failed` event; an active job is only flagged.
+      const onRevoked = (id: string) => {
+        if (pending.has(id) && this.jobs.get(id)?.state === 'failed') {
+          cleanup();
+          reject(new Error('revoked'));
+        }
+      };
+      // remove(), drain() and obliterate() delete records without a completed/failed event.
+      const sweep = () => {
+        for (const id of [...pending]) if (!this.jobs.has(id)) settle(id);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Jobs did not finish within ${timeout}ms: pending ${[...pending].join(', ')}`));
+      }, timeout);
+      timer.unref?.();
+      this.waitRejectors.add(rejectOnClose);
+      this.waitSweepers.add(sweep);
+      // Listeners first, then the current state: a job may settle across an await.
+      this.on('completed', onCompleted);
+      this.on('failed', onFailed);
+      this.on('revoked', onRevoked);
+      this.on('removed', sweep);
+      this.on('drained', sweep);
+      for (const id of [...pending]) {
+        const record = this.jobs.get(id);
+        if (record?.state === 'completed') settle(id);
+        else if (record?.state === 'failed') {
+          onFailed(new TestJob<D, R>(record), new Error(record.failedReason as string));
+          return;
+        }
+      }
+      sweep();
+    });
   }
 
   private waitForJobResult(jobId: string, timeoutMs: number): Promise<R> {
@@ -876,6 +958,16 @@ export class TestQueue<D = any, R = any> extends EventEmitter {
     this.dequeueRecord(record);
     record.state = 'delayed';
     this.schedulePromotion(record, delayMs);
+  }
+
+  /**
+   * @internal Park an active record like glidemq_moveActiveToDelayed (moveToDelayed,
+   * budget pause): parkDelayed plus the `delay-changed` event with the delay in ms.
+   * Retry backoff and rate-limit parking stay silent, as in production.
+   */
+  parkActiveDelayed(record: TestJobRecord<D, R>, delayMs: number): void {
+    this.parkDelayed(record, delayMs);
+    this.emit('delay-changed', record.id, delayMs);
   }
 
   /**
@@ -1085,6 +1177,7 @@ export class TestQueue<D = any, R = any> extends EventEmitter {
     for (const timer of this.promotionTimers.values()) clearTimeout(timer);
     this.promotionTimers.clear();
     this.jobs.clear();
+    for (const sweep of [...this.waitSweepers]) sweep();
     this.dedupEntries.clear();
     this.waitingQueue.length = 0;
     this.schedulers.clear();
@@ -2443,7 +2536,7 @@ export class TestWorker<D = any, R = any> extends EventEmitter {
         this.emit('budget-exceeded', job, record.id);
         if (budget?.onExceeded === 'pause') {
           // Like moveActiveToDelayed(now + 24h): parked until the budget is raised and the job promoted.
-          this.queue.parkDelayed(record, 86_400_000);
+          this.queue.parkActiveDelayed(record, 86_400_000);
           this.activeCount--;
           if (this.running && !this.queue.isPaused()) {
             this.processAvailable();
@@ -2527,7 +2620,7 @@ export class TestWorker<D = any, R = any> extends EventEmitter {
         }
         // moveToDelayed: park without counting an attempt, promote at the timestamp.
         if (err instanceof DelayedError) {
-          this.queue.parkDelayed(record, Math.max(0, err.delayedUntil - Date.now()));
+          this.queue.parkActiveDelayed(record, Math.max(0, err.delayedUntil - Date.now()));
           return;
         }
 
